@@ -387,6 +387,7 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
         else:
             timesteps_iter = tqdm.tqdm(timesteps, desc="Generating samples", total=len(timesteps))
 
+        total_steps = len(timesteps)
         for step_idx, t in enumerate(timesteps_iter):
             latent_model_input = latents
             timestep = [t]
@@ -399,11 +400,14 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
             )[0]
             latents = temp_x0.squeeze(0)
 
-            # Apply guided inpainting: blend original latent in masked regions
-            if guided_image is not None and guided_mask is not None:
-                # guided_mask: 1 = keep original (preserve), 0 = regenerate
-                # latents shape: (B, C, T, H, W), guided_image/mask same shape
-                latents = guided_mask * guided_image + (1 - guided_mask) * latents
+        # Apply guided inpainting ONLY at the final step (after all denoising)
+        # This allows the model to fully generate the person content, then we 
+        # replace only the background regions with the original
+        if guided_image is not None and guided_mask is not None:
+            # guided_mask: 1 = keep original (preserve background), 0 = keep generated (person)
+            # latents shape: (B, C, T, H, W), guided_image/mask same shape
+            latents = guided_mask * guided_image + (1 - guided_mask) * latents
+            log.info("Applied guided inpainting blend at final step")
 
         if self.net.is_context_parallel_enabled:
             if use_spatial_split:
