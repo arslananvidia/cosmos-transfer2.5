@@ -770,6 +770,56 @@ def read_and_process_control_input(
             if mask_prompt is not None:
                 mask_video_dict[modality] = control_mask_attr.float() / 255.0
 
+    # Process inpaint control separately (not a hint_key, no separate checkpoint needed)
+    inpaint_control_prompt = input_control_paths.get("inpaint_control_prompt")
+    inpaint_control_path = input_control_paths.get("inpaint")
+    inpaint_invert_mask = input_control_paths.get("inpaint_invert_mask", False)
+    
+    if inpaint_control_path and os.path.exists(inpaint_control_path):
+        # Load pre-computed inpaint mask
+        log.info(f"Loading pre-computed inpaint mask from: {inpaint_control_path}")
+        control_mask_attr, fps, _, _ = read_and_resize_input(
+            inpaint_control_path,
+            resolution=resolution,
+            interpolation=cv2.INTER_LINEAR,
+            s3_credential_path=s3_credential_path,
+        )
+        inpaint_mask = (control_mask_attr[:1] > 127.5).to(torch.bool)
+        if inpaint_invert_mask:
+            log.info("Inverting inpaint mask - white regions will be REGENERATED")
+            inpaint_mask = ~inpaint_mask
+        control_input_dict["control_input_inpaint_mask"] = inpaint_mask
+        mask_video_dict["inpaint"] = control_mask_attr.float() / 255.0
+    elif inpaint_control_prompt:
+        log.info(f"Generating inpaint mask from prompt: '{inpaint_control_prompt}'")
+        inpaint_mask_path = generate_control_weight_mask_from_prompt(
+            video_path=video_path, 
+            prompt=inpaint_control_prompt, 
+            output_folder=tempfile.gettempdir(), 
+            modality="inpaint"
+        )
+        if inpaint_mask_path:
+            control_mask_attr, fps, _, _ = read_and_resize_input(
+                inpaint_mask_path,
+                resolution=resolution,
+                interpolation=cv2.INTER_LINEAR,
+                s3_credential_path=s3_credential_path,
+            )
+            # Convert to boolean mask: white = True (preserved)
+            inpaint_mask = (control_mask_attr[:1] > 127.5).to(torch.bool)
+            
+            # Invert mask if requested (so segmented regions get regenerated)
+            if inpaint_invert_mask:
+                log.info("Inverting inpaint mask - segmented regions will be REGENERATED")
+                inpaint_mask = ~inpaint_mask
+            else:
+                log.info("Inpaint mask - segmented regions will be PRESERVED")
+            
+            control_input_dict["control_input_inpaint_mask"] = inpaint_mask
+            mask_video_dict["inpaint"] = control_mask_attr.float() / 255.0
+        else:
+            log.warning(f"Failed to generate inpaint mask from prompt '{inpaint_control_prompt}'")
+
     return control_input_dict, mask_video_dict
 
 

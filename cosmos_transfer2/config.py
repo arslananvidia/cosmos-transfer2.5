@@ -433,6 +433,22 @@ class SegConfig(ControlConfig):
     Default: first 128 words of the input prompt."""
 
 
+class InpaintConfig(ControlConfig):
+    """Arguments for inpaint control. Use this for selective region editing - preserve background while modifying masked regions."""
+
+    control_path: ResolvedFilePath | None = None
+    """Path to pre-computed binary inpaint mask video. White pixels = preserve original, Black pixels = regenerate with prompt."""
+    control_prompt: str | None = None
+    """Prompt describing what to segment for inpainting. The segmented regions will be PRESERVED (kept from original video).
+    To replace/modify an object, use a prompt that segments EVERYTHING EXCEPT that object.
+    Example: to replace a person, use 'background court floor sky' to preserve the background.
+    Alternatively, set invert_mask=True and use 'person' to invert the mask."""
+    invert_mask: bool = False
+    """If True, inverts the mask so that segmented regions are REGENERATED instead of preserved.
+    Useful when you want to specify what to REPLACE rather than what to KEEP.
+    Example: set invert_mask=True and control_prompt='person' to replace the person."""
+
+
 CONTROL_KEYS = ["edge", "vis", "depth", "seg"]
 
 
@@ -466,6 +482,7 @@ class InferenceArguments(CommonInferenceArguments):
     depth: DepthConfig | None = None
     vis: BlurConfig | None = None
     seg: SegConfig | None = None
+    inpaint: InpaintConfig | None = None
 
     seed: int = 2025
     "Seed for generation randomness."
@@ -500,6 +517,11 @@ class InferenceArguments(CommonInferenceArguments):
             control_modalities[key] = path_to_str(getattr(self, key).control_path)
             control_modalities[f"{key}_mask"] = path_to_str(getattr(self, key).mask_path)
             control_modalities[f"{key}_mask_prompt"] = getattr(self, key).mask_prompt
+        # Add inpaint parameters if inpaint is configured (separate from hint_keys)
+        if self.inpaint is not None:
+            control_modalities["inpaint"] = path_to_str(self.inpaint.control_path)
+            control_modalities["inpaint_control_prompt"] = self.inpaint.control_prompt
+            control_modalities["inpaint_invert_mask"] = getattr(self.inpaint, "invert_mask", False)
         return control_modalities
 
     @cached_property

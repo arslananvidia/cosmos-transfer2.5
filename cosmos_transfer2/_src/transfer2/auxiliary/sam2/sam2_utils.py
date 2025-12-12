@@ -71,11 +71,18 @@ def video_to_frames(input_loc, output_loc):
     count = 0
     print("Converting video..\n")
     # Start converting the video
+    max_retries = 5
+    retry_count = 0
     while cap.isOpened():
         # Extract the frame
         ret, frame = cap.read()
         if not ret:
+            retry_count += 1
+            if retry_count >= max_retries:
+                print(f"Warning: Failed to read frame after {max_retries} retries at frame {count}. Stopping extraction.")
+                break
             continue
+        retry_count = 0  # Reset retry count on successful read
         # Write the results back to output location.
         cv2.imwrite(output_loc + "/%#05d.jpg" % (count + 1), frame)
         count = count + 1
@@ -87,7 +94,7 @@ def video_to_frames(input_loc, output_loc):
             cap.release()
             # Print stats
             print("Done extracting frames.\n%d frames extracted" % count)
-            print("It took %d seconds forconversion." % (time_end - time_start))
+            print("It took %d seconds for conversion." % (time_end - time_start))
             break
 
 

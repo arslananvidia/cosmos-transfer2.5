@@ -425,13 +425,46 @@ class ControlVideo2WorldInference:
 
                 # Process control inputs as specified in the hint_key list.
                 # If pre-computed control inputs are provided, load them into the data batch.
+                inpaint_mask_padded = None
                 for k, v in control_input_dict.items():
                     cur_control_input = v[:, chunk_start_frame:chunk_end_frame]
-                    data_batch[k] = self._pad_input_frames(
+                    padded_control = self._pad_input_frames(
                         cur_control_input, cur_control_input.shape[1], num_video_frames_per_chunk
                     )
+                    data_batch[k] = padded_control
                     if k == "control_input_inpaint_mask":
                         data_batch["control_input_inpaint"] = cur_input_frames
+                        inpaint_mask_padded = padded_control  # Use padded version
+                
+                # Set up guided inpainting AFTER processing all control inputs
+                if inpaint_mask_padded is not None:
+                    # Set up guided inpainting for the model's x0_fn replacement trick
+                    # This actually preserves the original video in masked regions
+                    # Encode the input frames to latent space for guided inpainting
+                    input_for_guide = uint8_to_normalized_float(cur_input_frames, dtype=torch.bfloat16)[None].cuda()
+                    guided_latent = self.model.encode(input_for_guide).contiguous()
+                    data_batch["guided_image"] = guided_latent
+                    
+                    # Use the PADDED inpaint mask to match temporal dimensions
+                    inpaint_mask = inpaint_mask_padded.float()  # (1, T, H, W)
+                    T, H, W = inpaint_mask.shape[1], inpaint_mask.shape[2], inpaint_mask.shape[3]
+                    
+                    # Get actual latent dimensions from the encoded output
+                    _, C_latent, latent_T, latent_H, latent_W = guided_latent.shape
+                    
+                    # Resize mask to match latent dimensions exactly
+                    import torch.nn.functional as F
+                    inpaint_mask_resized = F.interpolate(
+                        inpaint_mask.unsqueeze(0).float(),  # (1, 1, T, H, W)
+                        size=(latent_T, latent_H, latent_W), 
+                        mode='nearest'
+                    ).squeeze(0)  # (1, T_latent, H_latent, W_latent)
+                    
+                    # Expand to match latent channels: (1, C_latent, T_latent, H_latent, W_latent)
+                    guided_mask = inpaint_mask_resized.unsqueeze(0).expand(1, C_latent, -1, -1, -1)
+                    data_batch["guided_mask"] = guided_mask.to(dtype=torch.bfloat16, device="cuda")
+                    
+                    log.info(f"Guided inpainting setup: guided_image shape={guided_latent.shape}, guided_mask shape={guided_mask.shape}")
                 # Otherwise, compute control inputs on-the-fly via the augmentor（applicable to edge and vis).
                 data_batch = get_augmentor_for_eval(
                     data_dict=data_batch,

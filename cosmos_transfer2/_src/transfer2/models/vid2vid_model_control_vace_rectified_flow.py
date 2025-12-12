@@ -288,6 +288,132 @@ class ControlVideo2WorldModelRectifiedFlow(Video2WorldModelRectifiedFlow):
 
         return velocity_fn
 
+    @torch.no_grad()
+    def generate_samples_from_batch(
+        self,
+        data_batch: Dict,
+        guidance: float = 1.5,
+        seed: int = 1,
+        state_shape: Tuple | None = None,
+        n_sample: int | None = None,
+        is_negative_prompt: bool = False,
+        num_steps: int = 35,
+        shift: float = 5.0,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Generate samples from the batch with guided inpainting support.
+        This override adds the ability to preserve original video in masked regions.
+        """
+        from cosmos_transfer2._src.imaginaire.utils import misc
+        from cosmos_transfer2._src.imaginaire.utils.context_parallel import broadcast_split_tensor, cat_outputs_cp, find_split
+        from cosmos_transfer2._src.imaginaire.flags import INTERNAL
+        import tqdm
+
+        # Extract guided inpainting parameters before they get modified
+        guided_image = data_batch.get("guided_image", None)
+        guided_mask = data_batch.get("guided_mask", None)
+        
+        if guided_image is not None and guided_mask is not None:
+            log.info(f"Guided inpainting enabled: image shape={guided_image.shape}, mask shape={guided_mask.shape}")
+            guided_image = guided_image.to(**self.tensor_kwargs)
+            guided_mask = guided_mask.to(**self.tensor_kwargs)
+
+        self._normalize_video_databatch_inplace(data_batch)
+        self._augment_image_dim_inplace(data_batch)
+        is_image_batch = self.is_image_batch(data_batch)
+        input_key = self.input_image_key if is_image_batch else self.input_data_key
+        if n_sample is None:
+            n_sample = data_batch[input_key].shape[0]
+        if state_shape is None:
+            _T, _H, _W = data_batch[input_key].shape[-3:]
+            state_shape = [
+                self.config.state_ch,
+                self.tokenizer.get_latent_num_frames(_T),
+                _H // self.tokenizer.spatial_compression_factor,
+                _W // self.tokenizer.spatial_compression_factor,
+            ]
+
+        noise = misc.arch_invariant_rand(
+            (n_sample,) + tuple(state_shape),
+            torch.float32,
+            self.tensor_kwargs["device"],
+            seed,
+        )
+
+        seed_g = torch.Generator(device=self.tensor_kwargs["device"])
+        seed_g.manual_seed(seed)
+
+        self.sample_scheduler.set_timesteps(
+            num_steps,
+            device=self.tensor_kwargs["device"],
+            shift=shift,
+            use_kerras_sigma=self.config.use_kerras_sigma_at_inference,
+        )
+
+        timesteps = self.sample_scheduler.timesteps
+
+        velocity_fn = self.get_velocity_fn_from_batch(data_batch, guidance, is_negative_prompt=is_negative_prompt)
+        use_spatial_split = False
+        if self.net.is_context_parallel_enabled:
+            cp_size = len(torch.distributed.get_process_group_ranks(self.get_context_parallel_group()))
+            n_views = noise.shape[2] // self.get_num_video_latent_frames()
+            use_spatial_split = cp_size > noise.shape[2] // n_views
+            after_split_shape = None
+            if use_spatial_split:
+                after_split_shape = find_split(noise.shape, cp_size, view_factor=n_views)
+                after_split_shape = torch.Size([after_split_shape[0] * n_views, *after_split_shape[1:]])
+                noise = rearrange(noise, "b c t h w -> b c (t h w)")
+                if guided_image is not None:
+                    guided_image = rearrange(guided_image, "b c t h w -> b c (t h w)")
+                if guided_mask is not None:
+                    guided_mask = rearrange(guided_mask, "b c t h w -> b c (t h w)")
+            noise = broadcast_split_tensor(tensor=noise, seq_dim=2, process_group=self.get_context_parallel_group())
+            # Also split guided_image and guided_mask for context parallel
+            if guided_image is not None:
+                guided_image = broadcast_split_tensor(tensor=guided_image, seq_dim=2, process_group=self.get_context_parallel_group())
+            if guided_mask is not None:
+                guided_mask = broadcast_split_tensor(tensor=guided_mask, seq_dim=2, process_group=self.get_context_parallel_group())
+            if use_spatial_split:
+                noise = rearrange(noise, "b c (t h w) -> b c t h w", t=after_split_shape[0], h=after_split_shape[1])
+                if guided_image is not None:
+                    guided_image = rearrange(guided_image, "b c (t h w) -> b c t h w", t=after_split_shape[0], h=after_split_shape[1])
+                if guided_mask is not None:
+                    guided_mask = rearrange(guided_mask, "b c (t h w) -> b c t h w", t=after_split_shape[0], h=after_split_shape[1])
+        latents = noise
+
+        if INTERNAL:
+            timesteps_iter = timesteps
+        else:
+            timesteps_iter = tqdm.tqdm(timesteps, desc="Generating samples", total=len(timesteps))
+
+        for step_idx, t in enumerate(timesteps_iter):
+            latent_model_input = latents
+            timestep = [t]
+
+            timestep = torch.stack(timestep)
+
+            velocity_pred = velocity_fn(noise, latent_model_input, timestep.unsqueeze(0))
+            temp_x0 = self.sample_scheduler.step(
+                velocity_pred.unsqueeze(0), t, latents[0].unsqueeze(0), return_dict=False, generator=seed_g
+            )[0]
+            latents = temp_x0.squeeze(0)
+
+            # Apply guided inpainting: blend original latent in masked regions
+            if guided_image is not None and guided_mask is not None:
+                # guided_mask: 1 = keep original (preserve), 0 = regenerate
+                # latents shape: (B, C, T, H, W), guided_image/mask same shape
+                latents = guided_mask * guided_image + (1 - guided_mask) * latents
+
+        if self.net.is_context_parallel_enabled:
+            if use_spatial_split:
+                latents = rearrange(latents, "b c t h w -> b c (t h w)")
+            latents = cat_outputs_cp(latents, seq_dim=2, cp_group=self.get_context_parallel_group())
+            if use_spatial_split:
+                latents = rearrange(latents, "b c (t h w) -> b c t h w", t=state_shape[1], h=state_shape[2])
+
+        return latents
+
     def _normalize_video_databatch_inplace(self, data_batch: dict[str, Tensor], input_key: str | None = None) -> None:
         """
         Normalizes video data in-place on a CUDA device to reduce data loading overhead.
